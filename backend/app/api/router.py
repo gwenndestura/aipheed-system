@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends
 
 from app.services.security import require_admin
 from app.api.v1 import (
-    admin, alerts, assessments, auth, dashboard, e107, e108, e109, e110, e111, e112, e113, fi5, fi6, fi7, fi9, fi10, forecast,
-    forecast_history, fpp, health, hunger_forecast, insights, final, lead2, quarterly, registry, report, simple,
+    admin, alerts, assessments, auth, dashboard, e107, e108, e109, e110, e111, e112, e113, fi5, fi6, fi7, fi9, fi10,
+    forecast, forecast_history, fpp, health, hunger_forecast, insights, final, lead2, quarterly, registry, report, simple,
 )
 
 router = APIRouter()

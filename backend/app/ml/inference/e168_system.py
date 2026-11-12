@@ -26,6 +26,23 @@ ROWS = DATA / "dashboard_rows.csv"
 MODEL_ID = "e168-lgbm-1.0"
 ISSUE = "2026-10-01"
 SEAL = "f8228fae"
+# E184 (docs/e184/PROTOCOL.md): E168 with synthetic training data balanced 50/50, same artifact schema. It is served by
+# this adapter only when the owner has promoted it in the registry; with E168 in production nothing below changes.
+E184_ID = "e184-lgbm-syn50-1.0"
+E184_DATA = Path(__file__).resolve().parents[3] / "data" / "e184" / "out"
+# E196 (docs/e196/REPORT.md): E184 averaged over its top-5 configurations x 20 draws, Lead 1 lagged-averaged. Served
+# only when promoted in the registry, in the same artifact schema.
+E196_ID = "e196-lgbm-avg5-laf-1.0"
+E196_DATA = Path(__file__).resolve().parents[3] / "data" / "e196" / "out"
+FAMILY = (MODEL_ID, E184_ID, E196_ID)
+NAMES = {E184_ID: "E184 LightGBM with balanced synthetic training data",
+         E196_ID: "E196 LightGBM (E184 averaged over 5 configurations, Lead-1 lagged averaging)"}
+SHORT = {E184_ID: "E184", E196_ID: "E196"}
+
+
+def _data_dir(mid: str) -> Path:
+    """The evaluation folder of a promoted family member (looked up at call time, so tests can redirect it)."""
+    return E196_DATA if mid == E196_ID else E184_DATA
 # The thesis's five triggers (Chapter III, Algorithm 2): market, climate, employment, OFW remittance and fish kill.
 # Fish kill is measured by a PROXY, PSA provincial fisheries production year-on-year (c_fish_yoy): no public fish-kill event
 # series exists, so the label says so. Employment and OFW remittances are national series (the same for every province).
@@ -33,7 +50,7 @@ SEAL = "f8228fae"
 # history they are shown as "Other model inputs", so the five bars plus Other add to 100 % of |contribution| (nothing is
 # rescaled away). Contributions are exact LightGBM pred_contrib values, which add, so a bar is the sum of its stored columns.
 GROUPS = {"market": "Market / Prices", "climate": "Climate Stress", "employment": "Employment (national)",
-          "ofw_remittance": "OFW Remittance (national)", "fish_kill": "Fish Kill (fisheries production proxy)"}
+          "ofw_remittance": "OFW Remittance (national)", "fish_kill": "Fish Production"}
 BAR_COLS = {"market": ("shap_market",), "climate": ("shap_climate",), "employment": ("shap_employment",),
             "ofw_remittance": ("shap_ofw_remittance",), "fish_kill": ("shap_fish_kill",)}
 OTHER_COLS = ("shap_poverty", "shap_other")
@@ -52,8 +69,8 @@ INDICATOR = {
     "definition": ("Forecast probability that the share of households with moderate or severe food insecurity (FNRI "
                    "HFIAS) in the province is 50% or more (HIGH). E168 starts from the latest published provincial survey "
                    "level and adds a constrained LightGBM forecast of the change, from the five trigger groups (market and "
-                   "prices; climate; employment and OFW remittances, both national series; and fish kill, measured by the "
-                   "proxy of provincial fisheries production change, not by fish-kill event records), with news signals "
+                   "prices; climate; employment and OFW remittances, both national series; and fish production, the "
+                   "change in total provincial fisheries production), with news signals "
                    "inside each group. Poverty and density are also inputs and weight the city and municipal ranking. "
                    "HIGH at 0.50."),
     "unit": "probability 0-1 (HIGH at 0.50)",
@@ -103,12 +120,20 @@ def _production(path: str, mtime: int) -> str | None:
         return None
 
 
+def served_id() -> str:
+    """The production model of this adapter's family (E168, or E184 once the owner promotes it); E168 otherwise."""
+    from app import registry as R
+    reg = R.DIR / "registry.json"
+    prod = _production(str(reg), reg.stat().st_mtime_ns) if reg.exists() else None
+    return prod if prod in FAMILY else MODEL_ID
+
+
 def active() -> bool:
     if os.getenv("AIPHEED_MAP_MODEL", "auto").lower() not in ("auto", "e168") or not ROWS.exists():
         return False
     from app import registry as R
     reg = R.DIR / "registry.json"
-    return reg.exists() and _production(str(reg), reg.stat().st_mtime_ns) == MODEL_ID
+    return reg.exists() and _production(str(reg), reg.stat().st_mtime_ns) in FAMILY
 
 
 def not_served_reasons() -> list[str]:
@@ -121,8 +146,8 @@ def not_served_reasons() -> list[str]:
     if not ROWS.exists():
         out.append(f"served rows missing: {ROWS}")
     prod = _production(str(reg), reg.stat().st_mtime_ns) if reg.exists() else None
-    if prod != MODEL_ID:
-        out.append(f"registry production model is {prod!r}, not {MODEL_ID}")
+    if prod not in FAMILY:
+        out.append(f"registry production model is {prod!r}, not one of {FAMILY}")
     return out
 
 
@@ -170,10 +195,16 @@ def _f(x) -> float | None:
     return None if x in (None, "", "nan") else float(x)
 
 
-@functools.lru_cache(maxsize=1)
 def evaluation() -> dict:
-    H = json.loads((DATA / "lead_horizon.json").read_text(encoding="utf-8"))
-    tm_path = DATA / "thesis_metrics.json"
+    """The served model's own evaluation (E168's, or E184's once it is in production)."""
+    return _evaluation(served_id())
+
+
+@functools.lru_cache(maxsize=4)
+def _evaluation(mid: str) -> dict:
+    base = DATA if mid == MODEL_ID else _data_dir(mid)
+    H = json.loads((base / "lead_horizon.json").read_text(encoding="utf-8"))
+    tm_path = base / "thesis_metrics.json"
     T = json.loads(tm_path.read_text(encoding="utf-8")) if tm_path.exists() else {}
     rl = H.get("horizon_75pct_and_beats_persistence") or 0
     leads, hz = {}, {}
@@ -197,7 +228,7 @@ def evaluation() -> dict:
                          "baseline_accuracy": {"ALWAYS-LOW": always_low, "PERSISTENCE": v["persistence_accuracy"]},
                          "metrics": {"n": n, "accuracy": a, "balanced_accuracy": round((v["high_recall"] + v["low_recall"]) / 2, 3),
                                      "precision": m.get("precision_high", v["precision"]), "recall": m.get("recall_high", v["high_recall"]),
-                                     "f1": m.get("f1_high"), "auc": m.get("auc_roc"), "brier": v["brier"], **cm, "correct": v["correct"],
+                                     "f1": m.get("f1_high"), "f1_weighted": m.get("f1_weighted"), "f1_macro": m.get("f1_macro"), "auc": m.get("auc_roc"), "brier": v["brier"], **cm, "correct": v["correct"],
                                      "persistence_accuracy": v["persistence_accuracy"]}}
         hz[str(k)] = {"n": n, "n_quarters": leads[str(k)]["n_quarters"], "accuracy": a, "always_low_accuracy": always_low,
                       "reliable": int(k) <= rl, "criteria": {"accuracy_at_least_75": ok75, "better_than_latest_survey": beats},
@@ -206,10 +237,78 @@ def evaluation() -> dict:
                      "max_reliable_lead": rl, "individually_passing_leads": [int(k) for k, v in hz.items() if all(v["criteria"].values())],
                      "why_not_longer": "Lead 4 accuracy is below 75% (the model still beats the latest survey up to Lead 6).",
                      "leads": hz}
-    return {"model": MODEL_ID, "max_reliable_lead": rl, "leads": leads, "horizon": horizon_block,
-            "skill_horizon": H.get("skill_horizon_beats_persistence"), "seal_sha256": SEAL, "seal_issue_date": "ENNS 2022 forecasts",
+    return {"model": mid, "max_reliable_lead": rl, "leads": leads, "horizon": horizon_block,
+            "skill_horizon": H.get("skill_horizon_beats_persistence"), "seal_sha256": SEAL if mid == MODEL_ID else _seal_of(mid),
+            "seal_issue_date": "ENNS 2022 forecasts",
             "protocol_name": "owner-defined acceptance (2026-11-07)",
             "acceptance_rule": "accuracy >= 75% and Brier significantly better than reusing the latest survey (set 2026-11-07, after the results were known)"}
+
+
+evaluation.cache_clear = _evaluation.cache_clear
+
+
+def _seal_of(mid: str) -> str:
+    p = _data_dir(mid) / "sealed_enns2022.json"
+    if not p.exists():
+        return "not sealed"
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:8]
+
+
+def _e184_seal() -> str:
+    p = E184_DATA / "sealed_enns2022.json"
+    if not p.exists():
+        return "not sealed"
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:8]
+
+
+@functools.lru_cache(maxsize=2)
+def _relabels(mid: str) -> tuple[tuple[str, str], ...]:
+    """Text replacements when E184 is the served model: its own name, id, seal and accuracy instead of E168's."""
+    if mid == MODEL_ID:
+        return ()
+    m = _evaluation(mid)["leads"]
+    a1, p1 = m["1"]["metrics"]["accuracy"] * 100, m["1"]["metrics"]["persistence_accuracy"] * 100
+    short, name = SHORT.get(mid, "E184"), NAMES.get(mid, NAMES[E184_ID])
+    rl = _evaluation(mid)["max_reliable_lead"]
+    extra = (" Each forecast averages its 5 best model configurations, and the one-quarter-ahead forecast also averages the "
+             "forecast made a quarter earlier for the same quarter.") if mid == E196_ID else ""
+    return (
+        ("accuracy 75.0% at one quarter ahead against 62.5% for the latest survey alone. It tends to over-predict by about 3 "
+         "points (about 2 in 5 HIGH calls were false alarms) and rarely misses a HIGH province.",
+         f"accuracy {a1:.1f}% at one quarter ahead against {p1:.1f}% for the latest survey alone. It was trained on the real "
+         "survey rows plus an equal number of labelled synthetic rows (never used in testing)." + extra),
+        ("Lead 4 (73.6%) does not.", f"{short} was evaluated at Leads 1-{len(m)}."),
+        ("Lead 4 accuracy 73.6% is below 75% (it still beats the latest survey up to Lead 6).", f"{short} was evaluated at Leads 1-{len(m)} (reliable up to Lead {rl})."),
+        ("Lead 4 accuracy is below 75% (the model still beats the latest survey up to Lead 6).", f"{short} was evaluated at Leads 1-{len(m)} (reliable up to Lead {rl})."),
+        (MODEL_ID, mid),
+        ("E168 LightGBM", name),
+        (SEAL, _seal_of(mid)),
+        ("E168", short),
+    )
+
+
+def relabel(obj):
+    """Return `obj` with E168's name, id, seal and accuracy sentences replaced by E184's when E184 is the production model.
+    With E168 in production it returns `obj` itself, unchanged."""
+    reps = _relabels(served_id())
+    if not reps:
+        return obj
+
+    def sub(x):
+        if isinstance(x, str):
+            for a, b in reps:
+                x = x.replace(a, b)
+            return x
+        if isinstance(x, dict):
+            return {k: sub(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [sub(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(sub(v) for v in x)
+        return x
+    return sub(obj)
 
 
 def structural() -> bool:
@@ -309,6 +408,10 @@ def province_row(code: str, name: str, quarter: str, base: dict | None) -> dict 
     p = float(r["probability"])
     what = (f"{reliability_text(r)}; issued {r['issue_date']}; forecast HFIAS moderate+severe {float(r['score_pct']):.1f}% "
             f"(90% range {float(r['range90_low']):.1f}-{float(r['range90_high']):.1f}%); the outcome is not yet published.")
+    from app.e168 import robust as RB
+    warn = RB.warning(r)                     # E183: rows staged since E183 say when inputs were missing and filled
+    if warn:
+        what = f"{what} {warn}"
     out = dict(base or {})
     out.update({
         "province_code": code, "province_name": name, "quarter": quarter,
@@ -531,10 +634,10 @@ def plain_evidence(code: str | None, quarter: str, group: str) -> str | None:
         f = v("c_fish_yoy")
         if f is None:
             return none
-        why = ("A smaller catch means less fish to eat and less income for fishing families." if f < 0 else
-               "A bigger catch means more fish to eat and more income for fishing families.")
+        why = ("Lower fish production means less fish to eat and less income for fishing families." if f < 0 else
+               "Higher fish production means more fish to eat and more income for fishing families.")
         when, prev = _production_text("fish", issue)
-        return (f"The fish catch in {r['province']} {when} was {_change(100 * (math.exp(f) - 1))} than in {prev}. "
+        return (f"Fish production in {r['province']} {when} was {_change(100 * (math.exp(f) - 1))} than in {prev}. "
                 f"{why} {_effect(r, group)}")
     if group == "employment":
         rate, yoy = v("unemp_rate"), v("unemp_yoy")
@@ -586,7 +689,7 @@ def _region_evidence(rs: list[dict], group: str) -> str | None:
         return lead + "Typhoons, soil moisture and farm harvests also count. " + eff
     if group == "fish_kill" and vals("c_fish_yoy"):
         when, prev = _production_text("fish", issue)
-        return (f"The fish catch {when} changed by {rng(vals('c_fish_yoy'), lambda x: 100 * (math.exp(x) - 1))} across "
+        return (f"Fish production {when} changed by {rng(vals('c_fish_yoy'), lambda x: 100 * (math.exp(x) - 1))} across "
                 f"the five provinces compared with {prev}. {eff}")
     if group == "employment" and vals("unemp_rate"):
         m = _latest_month(issue, 45, "lfs")
@@ -659,7 +762,7 @@ def data_used() -> dict:
         "oni": ("El Niño", rng(oni_m - pd.DateOffset(months=2), oni_m)),
         "employment": ("Unemployment", f"{_latest_month(issue, 45, 'lfs'):%b %Y}"),
         "ofw_remittance": ("OFW remittances", str(_remit_year(issue))),
-        "fish_kill": ("Fish catch", prod_short("fish")),
+        "fish_kill": ("Fish production", prod_short("fish")),
         "news": ("News", rng(news_from, last_day)),
         "poverty": ("Poverty & population", "2023, 2024"),
     }
@@ -679,7 +782,7 @@ def data_used() -> dict:
          "period": m(_latest_month(issue, 45, "lfs")), "note": "Compared with the same month a year before"},
         {"group": "ofw_remittance", "name": "Money sent home by OFWs", "source": "BSP (World Bank series)", "level": "National",
          "period": f"{_remit_year(issue)} full year", "note": "Compared with the year before"},
-        {"group": "fish_kill", "name": "Fish catch", "source": "PSA", "level": "Province", "period": prod("fish")},
+        {"group": "fish_kill", "name": "Fish production", "source": "PSA", "level": "Province", "period": prod("fish")},
         {"group": "news", "name": "News reports", "source": "Rappler, Vera Files, Newsbytes, PCIJ and earlier archives",
          "level": "Province, area and national", "period": f"{news_from.day} {m(news_from)} to {last_day.day} {m(last_day)}"},
         {"group": "poverty", "name": "Poverty and population", "source": "PSA", "level": "Province",
